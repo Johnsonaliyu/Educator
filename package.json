@@ -1,0 +1,8 @@
+{
+  "name": "student-helper-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Cloud API chatbot that helps students in any subject (Groq primary, Nvidia fallback)",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" }
+}
