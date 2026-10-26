@@ -17,7 +17,7 @@ const GRAPH = "https://graph.facebook.com/v21.0";
 // checked against Meta's x-hub-signature-256 header.
 export const config = { api: { bodyParser: false } };
 
-const MAX_WORDS = 200;
+const MAX_WORDS = 300;
 
 const SYSTEM_PROMPT = `You are Sensei, a friendly study helper for students on WhatsApp.
 - Help with any school or university subject.
@@ -26,6 +26,8 @@ const SYSTEM_PROMPT = `You are Sensei, a friendly study helper for students on W
 - Use plain text only. Never use asterisks, markdown, bold, headers, tables or code blocks. For lists, put each item on its own line starting with a number like 1. or a dash.
 - If the question is clear enough to answer, answer it straight away with steps. Ask a clarifying question only if you truly cannot answer without it, and never more than one at a time.
 - If a student only names a subject or topic, give a short overview and 2 example problems they can pick from.
+- Write maths in plain text using symbols like ² ³ √ × ÷ ≤ ≥ π and fractions like 5/6. Never use LaTeX, dollar signs or backslashes.
+- Put each step on its own line, with a blank line between steps, and end with a clear final answer.
 - Don't just do graded work for the student; guide them to the answer.`;
 
 // Simple in-memory history (resets on cold start). Use Supabase for permanent history.
@@ -146,10 +148,57 @@ Here's what I can do:
 Just type your question to get started.`;
 }
 
+// WhatsApp can't render LaTeX, so convert maths into readable Unicode text
+// (x², √144, 5/6, ×, ≤, π ...). Works even if the AI slips and writes LaTeX.
+const SUP = { 0:"⁰",1:"¹",2:"²",3:"³",4:"⁴",5:"⁵",6:"⁶",7:"⁷",8:"⁸",9:"⁹","+":"⁺","-":"⁻","−":"⁻",n:"ⁿ",i:"ⁱ",x:"ˣ",y:"ʸ" };
+const SUB = { 0:"₀",1:"₁",2:"₂",3:"₃",4:"₄",5:"₅",6:"₆",7:"₇",8:"₈",9:"₉","+":"₊","-":"₋",n:"ₙ",x:"ₓ",i:"ᵢ" };
+const SYMBOLS = {
+  times:"×", cdot:"·", div:"÷", pm:"±", mp:"∓", leq:"≤", le:"≤", geq:"≥", ge:"≥",
+  neq:"≠", ne:"≠", approx:"≈", infty:"∞", pi:"π", theta:"θ", alpha:"α", beta:"β",
+  gamma:"γ", delta:"δ", Delta:"Δ", lambda:"λ", mu:"μ", sigma:"σ", Sigma:"Σ",
+  omega:"ω", Omega:"Ω", phi:"φ", rho:"ρ", epsilon:"ε", int:"∫", sum:"∑", prod:"∏",
+  rightarrow:"→", to:"→", Rightarrow:"⇒", leftarrow:"←", circ:"°", degree:"°",
+  ldots:"…", dots:"…", therefore:"∴", because:"∵", in:"∈", subset:"⊂", cup:"∪",
+  cap:"∩", angle:"∠", perp:"⊥", parallel:"∥", partial:"∂", nabla:"∇", sin:"sin",
+  cos:"cos", tan:"tan", log:"log", ln:"ln", lim:"lim", left:"", right:"", quad:" ", qquad:"  "
+};
+const toScript = (s, map) => ([...s].every((c) => c in map) ? [...s].map((c) => map[c]).join("") : null);
+const wrap = (s) => (/^[\w.²³]+$/.test(s.trim()) ? s.trim() : `(${s.trim()})`);
+
+function mathToUnicode(text) {
+  let t = String(text);
+  // remove math delimiters like $...$ (but leave plain money amounts alone)
+  t = t.replace(/\$\$?([^$]+?)\$\$?/g, (m, inner) => (/[\\^_{}=]/.test(inner) ? inner : m));
+  t = t.replace(/\\[()[\]]/g, "");
+  // powers and subscripts
+  t = t.replace(/\^\{([^{}]+)\}|\^(-?\d+|[nixy])/g, (m, a, b) => {
+    const body = a ?? b;
+    return toScript(body, SUP) ?? `^(${body})`;
+  });
+  t = t.replace(/_\{([^{}]+)\}|_(\d)/g, (m, a, b) => {
+    const body = a ?? b;
+    return toScript(body, SUB) ?? `_${body}`;
+  });
+  // fractions, roots, text wrappers (inner-most first, repeated for nesting)
+  for (let i = 0; i < 5; i++) {
+    t = t.replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, (m, a, b, off, str) => {
+      const f = `${a.trim()}/${b.trim()}`;
+      // keep "2x(dx/dt)" readable when a fraction follows a letter or number
+      return /[\w)]/.test(str[off - 1] || "") ? ` (${f})` : /^[\w.²³]+\/[\w.²³]+$/.test(f) ? f : `${wrap(a)}/${wrap(b)}`;
+    });
+    t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, (m, a) => `√${wrap(a)}`);
+    t = t.replace(/\\(?:text|mathrm|mathbf|textbf|mathit)\s*\{([^{}]*)\}/g, "$1");
+  }
+  // symbols (\times, \pi, \leq ...)
+  t = t.replace(/\\([A-Za-z]+)/g, (m, name) => (name in SYMBOLS ? SYMBOLS[name] : m));
+  t = t.replace(/\\%/g, "%").replace(/\\\\/g, "\n").replace(/\\[,;:! ]/g, " ");
+  return t;
+}
+
 // Safety net: strip markdown symbols and enforce the word limit,
 // even if the AI ignores the instructions.
 function cleanReply(text) {
-  let t = String(text)
+  let t = mathToUnicode(String(text))
     .replace(/(\d|\))\s*\*\s*(\d|\()/g, "$1 × $2") // keep maths like 3*4
     .replace(/^\s*[*•]\s+/gm, "- ")                    // bullets
     .replace(/\*/g, "")                                  // remaining asterisks
@@ -254,4 +303,3 @@ export default async function handler(req, res) {
 
   return res.status(405).send("Method not allowed");
 }
-
