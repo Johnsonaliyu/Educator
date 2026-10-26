@@ -17,12 +17,15 @@ const GRAPH = "https://graph.facebook.com/v21.0";
 // checked against Meta's x-hub-signature-256 header.
 export const config = { api: { bodyParser: false } };
 
-const SYSTEM_PROMPT = `You are a friendly study helper for students on WhatsApp.
+const MAX_WORDS = 200;
+
+const SYSTEM_PROMPT = `You are Sensei, a friendly study helper for students on WhatsApp.
 - Help with any school or university subject.
 - Explain step by step so the student understands the method, not just the answer.
-- Keep replies short and clear (WhatsApp, under 1500 characters). Use simple words.
-- Use plain text only: no markdown tables or headers. Use *bold* sparingly.
-- If a question is unclear, ask one short clarifying question.
+- Every reply must be ${MAX_WORDS} words or fewer. Use simple words.
+- Use plain text only. Never use asterisks, markdown, bold, headers, tables or code blocks. For lists, put each item on its own line starting with a number like 1. or a dash.
+- If the question is clear enough to answer, answer it straight away with steps. Ask a clarifying question only if you truly cannot answer without it, and never more than one at a time.
+- If a student only names a subject or topic, give a short overview and 2 example problems they can pick from.
 - Don't just do graded work for the student; guide them to the answer.`;
 
 // Simple in-memory history (resets on cold start). Use Supabase for permanent history.
@@ -47,6 +50,8 @@ async function sendWhatsApp(to, text) {
   if (!res.ok) console.error("Send failed:", res.status, await res.text());
 }
 
+// Marks the message as read AND shows the "typing..." indicator to the student.
+// WhatsApp keeps it visible until the reply is sent (max about 25 seconds).
 async function markRead(messageId) {
   await fetch(`${GRAPH}/${process.env.PHONE_NUMBER_ID}/messages`, {
     method: "POST",
@@ -59,6 +64,7 @@ async function markRead(messageId) {
       messaging_product: "whatsapp",
       status: "read",
       message_id: messageId,
+      typing_indicator: { type: "text" },
     }),
   }).catch(() => {});
 }
@@ -124,6 +130,48 @@ function hasValidMetaSignature(signature, rawBody) {
     && timingSafeEqual(receivedBytes, expectedBytes);
 }
 
+// Greetings are answered instantly (no AI call) with the student's WhatsApp name.
+const GREETING_RE =
+  /^(hi+|hey+|hello+|hola|howdy|yo|sup|greetings|good\s*(morning|afternoon|evening|day))(\s+(there|sensei|everyone|all))?[\s!.,?]*$/i;
+
+function greetingReply(name) {
+  const first = (name || "").trim().split(/\s+/)[0] || "there";
+  return `Hi ${first}! 👋 I'm Sensei, your study helper.
+
+Here's what I can do:
+1. Help with any school or university subject, from maths and science to history and languages
+2. Explain things step by step so you understand the method, not just the answer
+3. Guide you through practice questions and revision
+
+Just type your question to get started.`;
+}
+
+// Safety net: strip markdown symbols and enforce the word limit,
+// even if the AI ignores the instructions.
+function cleanReply(text) {
+  let t = String(text)
+    .replace(/(\d|\))\s*\*\s*(\d|\()/g, "$1 × $2") // keep maths like 3*4
+    .replace(/^\s*[*•]\s+/gm, "- ")                    // bullets
+    .replace(/\*/g, "")                                  // remaining asterisks
+    .replace(/^#{1,6}\s*/gm, "")                         // headers
+    .replace(/`{1,3}/g, "")                               // code ticks
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  // Cut to MAX_WORDS, ending on a full sentence where possible
+  const re = /\S+/g;
+  let m, count = 0, end = t.length;
+  while ((m = re.exec(t))) {
+    if (++count === MAX_WORDS) { end = m.index + m[0].length; break; }
+  }
+  if (end < t.length) {
+    t = t.slice(0, end);
+    const stop = t.search(/[.!?](?=[^.!?]*$)/);
+    if (stop > t.length * 0.6) t = t.slice(0, stop + 1);
+  }
+  return t;
+}
+
 async function askAI(from, userText) {
   const turns = history.get(from) || [];
   turns.push({ role: "user", content: userText });
@@ -137,7 +185,7 @@ async function askAI(from, userText) {
   for (const p of PROVIDERS) {
     if (!p.key()) continue; // skip providers with no key set
     try {
-      const reply = await callProvider(p, messages);
+      const reply = cleanReply(await callProvider(p, messages));
       turns.push({ role: "assistant", content: reply });
       history.set(from, turns.slice(-MAX_TURNS));
       return reply;
@@ -188,7 +236,14 @@ export default async function handler(req, res) {
         return res.status(200).send("ok");
       }
 
-      const reply = await askAI(from, msg.text.body);
+      const text = msg.text.body.trim();
+      if (GREETING_RE.test(text)) {
+        const name = payload?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name;
+        await sendWhatsApp(from, greetingReply(name));
+        return res.status(200).send("ok");
+      }
+
+      const reply = await askAI(from, text);
       await sendWhatsApp(from, reply);
     } catch (err) {
       console.error(err);
@@ -199,3 +254,4 @@ export default async function handler(req, res) {
 
   return res.status(405).send("Method not allowed");
 }
+
