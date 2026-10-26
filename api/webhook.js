@@ -17,7 +17,7 @@ const GRAPH = "https://graph.facebook.com/v21.0";
 // checked against Meta's x-hub-signature-256 header.
 export const config = { api: { bodyParser: false } };
 
-const MAX_WORDS = 300;
+const MAX_WORDS = 200;
 
 const SYSTEM_PROMPT = `You are Sensei, a friendly study helper for students on WhatsApp.
 - Help with any school or university subject.
