@@ -8,6 +8,7 @@
 //   NVIDIA_API_KEY   fallback AI (build.nvidia.com)
 //   GROQ_MODEL       optional, defaults to openai/gpt-oss-120b
 //   NVIDIA_MODEL     optional, defaults to meta/llama-3.3-70b-instruct
+//   SUPABASE_URL, SUPABASE_SERVICE_KEY   optional; saves chats for the dashboard
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
@@ -221,6 +222,31 @@ function cleanReply(text) {
   return t;
 }
 
+// Saves each exchange to Supabase for the admin dashboard.
+// It never blocks or breaks a reply: if logging fails, the bot still works.
+async function logInteraction({ phone, name, userMsg, botMsg, provider }) {
+  const base = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!base || !key) return; // dashboard logging is optional
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, "")}/rest/v1/rpc/log_interaction`, {
+      method: "POST",
+      signal: AbortSignal.timeout(4000),
+      headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        p_phone: phone,
+        p_name: name || null,
+        p_user_msg: userMsg,
+        p_bot_msg: botMsg,
+        p_provider: provider,
+      }),
+    });
+    if (!res.ok) console.error("Log failed:", res.status, await res.text());
+  } catch (err) {
+    console.error("Log error:", err.message);
+  }
+}
+
 async function askAI(from, userText) {
   const turns = history.get(from) || [];
   turns.push({ role: "user", content: userText });
@@ -237,14 +263,14 @@ async function askAI(from, userText) {
       const reply = cleanReply(await callProvider(p, messages));
       turns.push({ role: "assistant", content: reply });
       history.set(from, turns.slice(-MAX_TURNS));
-      return reply;
+      return { reply, provider: p.name.toLowerCase() };
     } catch (err) {
       console.error(`${p.name} failed, trying next:`, err.message);
     }
   }
 
   turns.pop(); // don't keep the unanswered question in history
-  return "Sorry, I'm having trouble right now. Please try again in a moment.";
+  return { reply: "Sorry, I'm having trouble right now. Please try again in a moment.", provider: "error" };
 }
 
 export default async function handler(req, res) {
@@ -278,22 +304,27 @@ export default async function handler(req, res) {
       if (!msg) return res.status(200).send("ok"); // status updates etc.
 
       const from = msg.from;
+      const name = payload?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name;
       await markRead(msg.id);
 
       if (msg.type !== "text") {
-        await sendWhatsApp(from, "Please send your question as a text message for now. 📚");
+        const note = "Please send your question as a text message for now. 📚";
+        await sendWhatsApp(from, note);
+        await logInteraction({ phone: from, name, userMsg: `[${msg.type} message]`, botMsg: note, provider: "system" });
         return res.status(200).send("ok");
       }
 
       const text = msg.text.body.trim();
       if (GREETING_RE.test(text)) {
-        const name = payload?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name;
-        await sendWhatsApp(from, greetingReply(name));
+        const greeting = greetingReply(name);
+        await sendWhatsApp(from, greeting);
+        await logInteraction({ phone: from, name, userMsg: text, botMsg: greeting, provider: "greeting" });
         return res.status(200).send("ok");
       }
 
-      const reply = await askAI(from, text);
+      const { reply, provider } = await askAI(from, text);
       await sendWhatsApp(from, reply);
+      await logInteraction({ phone: from, name, userMsg: text, botMsg: reply, provider });
     } catch (err) {
       console.error(err);
     }
@@ -302,4 +333,4 @@ export default async function handler(req, res) {
   }
 
   return res.status(405).send("Method not allowed");
-}
+  }
